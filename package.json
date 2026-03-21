@@ -1,0 +1,7 @@
+{
+  "name": "@acme/api-client",
+  "version": "3.1.0",
+  "dependencies": {
+    "@acme/auth": "2.4.1-pr.1.0"
+  }
+}
