@@ -49,22 +49,23 @@ jobs:
 
       - name: Apply dependency bumps
         run: |
+          # Create package.json if it doesn't exist (demo repo)
+          if [ ! -f package.json ]; then
+            echo '{"name":"@acme/api-client","version":"3.1.0","dependencies":{"@acme/auth":"^2.3.0"}}' | jq '.' > package.json
+            echo "Created package.json"
+          fi
+
           # Update package.json with the new versions
           echo '${{ inputs.bumps }}' | jq -c '.[]' | while read bump; do
             PKG=$(echo "$bump" | jq -r '.pkg')
             VER=$(echo "$bump" | jq -r '.version')
             echo "Bumping $PKG to $VER"
-
-            # Update package.json using jq
-            if [ -f package.json ]; then
-              jq --arg pkg "$PKG" --arg ver "$VER" \
-                '(.dependencies[$pkg] // empty) = $ver | (.devDependencies[$pkg] // empty) = $ver' \
-                package.json > package.json.tmp && mv package.json.tmp package.json
-            fi
+            jq --arg pkg "$PKG" --arg ver "$VER" '.dependencies[$pkg] = $ver' \
+              package.json > package.json.tmp && mv package.json.tmp package.json
           done
 
-          # Run npm install to update the lockfile (if the packages exist on the registry)
-          # In a real monorepo, packages are published to a private registry
+          # Run npm install to update the lockfile
+          # In production: npm install points at your private registry
           npm install --package-lock-only 2>/dev/null || echo "Lockfile update skipped (private packages)"
 
           echo "::group::Updated package.json"
