@@ -1,0 +1,182 @@
+# Demonstrates GHA log improvement techniques:
+#   - ::error:: / ::warning:: / ::notice:: annotations
+#   - ::group:: for collapsing verbose output
+#   - $GITHUB_STEP_SUMMARY for rich summaries
+#   - Problem matchers for auto-annotating tsc/eslint output
+#   - Noise suppression (--loglevel=error, --silent)
+#   - continue-on-error + post-process for surfacing failures
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── Problem Matchers ──────────────────────────────────────
+      # Register before any tool runs so their output is auto-parsed
+      # into inline PR annotations. No manual ::error file= needed.
+      - name: Register problem matchers
+        run: |
+          echo "::add-matcher::.github/problem-matchers/tsc.json"
+          echo "::add-matcher::.github/problem-matchers/eslint-compact.json"
+
+      # ── Install (noise-suppressed) ────────────────────────────
+      # --loglevel=error hides hundreds of lines of resolution noise
+      - name: Install dependencies
+        run: |
+          echo "::group::npm install"
+          if [ -f package-lock.json ]; then
+            npm ci --loglevel=error
+          elif [ -f package.json ]; then
+            npm install --loglevel=error
+          else
+            echo "::notice::No package.json found — skipping install"
+          fi
+          echo "::endgroup::"
+
+      # ── Typecheck ─────────────────────────────────────────────
+      # tsc errors are auto-annotated by the problem matcher above.
+      # The ::group:: collapses the raw compiler output.
+      - name: Typecheck
+        id: typecheck
+        continue-on-error: true
+        run: |
+          if [ -f tsconfig.json ]; then
+            echo "::group::tsc --noEmit"
+            npx tsc --noEmit 2>&1 | tee /tmp/tsc-output.log
+            echo "::endgroup::"
+          else
+            echo "::notice::No tsconfig.json — skipping typecheck"
+          fi
+
+      # ── Code quality scan ─────────────────────────────────────
+      # Scans source for BUG/WARNING/TODO/FIXME/HACK comments and
+      # surfaces them as ::warning:: or ::notice:: annotations that
+      # appear inline on the PR diff and in the Actions summary.
+      - name: Scan for code quality markers
+        run: |
+          echo "::group::Scanning for BUG/WARNING/TODO/FIXME/HACK markers"
+          FOUND=0
+
+          # BUG and WARNING → ::warning (shows in PR annotations)
+          grep -rn "// BUG:\|// WARNING:" src/ 2>/dev/null | while IFS=: read -r FILE LINE MSG; do
+            CLEAN_MSG=$(echo "$MSG" | sed 's|^[[:space:]]*// ||')
+            echo "::warning file=$FILE,line=$LINE::$CLEAN_MSG"
+            FOUND=$((FOUND + 1))
+          done
+
+          # TODO/FIXME/HACK → ::notice (lighter, still visible)
+          grep -rn "// TODO:\|// FIXME:\|// HACK:" src/ 2>/dev/null | while IFS=: read -r FILE LINE MSG; do
+            CLEAN_MSG=$(echo "$MSG" | sed 's|^[[:space:]]*// ||')
+            echo "::notice file=$FILE,line=$LINE::$CLEAN_MSG"
+          done
+
+          echo "::endgroup::"
+
+      # ── Tests (with error extraction) ─────────────────────────
+      # continue-on-error lets us capture output, then a follow-up
+      # step extracts just the failures into the summary.
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: |
+          if [ -f package.json ] && grep -q '"test"' package.json 2>/dev/null; then
+            echo "::group::npm test"
+            npm test 2>&1 | tee /tmp/test-output.log
+            EXIT=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            exit $EXIT
+          else
+            echo "::notice::No test script defined — skipping tests"
+          fi
+
+      # ── Surface test failures ─────────────────────────────────
+      # Only runs when tests fail. Extracts the interesting lines
+      # (FAIL, Error, Assert) into the summary so you don't have
+      # to dig through the full log.
+      - name: Surface test failures
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "::error::Tests failed — see job summary for details"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<'HEADER'
+          ## :x: Test Failures
+
+          ```
+          HEADER
+
+          grep -A 5 "FAIL\|Error\|AssertionError\|Expected\|✕\|✗" /tmp/test-output.log | head -60 >> "$GITHUB_STEP_SUMMARY"
+
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Job summary ──────────────────────────────────────────
+      # Always runs. Writes a concise table to the Actions summary
+      # page so you can see results at a glance without opening logs.
+      - name: Write job summary
+        if: always()
+        run: |
+          TYPECHECK="${{ steps.typecheck.outcome }}"
+          TESTS="${{ steps.tests.outcome }}"
+
+          typecheck_icon() {
+            case "$1" in
+              success) echo ":white_check_mark:" ;;
+              failure) echo ":x:" ;;
+              *) echo ":heavy_minus_sign:" ;;
+            esac
+          }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## CI Results
+
+          | Step | Result |
+          |------|--------|
+          | Typecheck | $(typecheck_icon "$TYPECHECK") $TYPECHECK |
+          | Tests | $(typecheck_icon "$TESTS") $TESTS |
+
+          SUMMARY
+
+          # Count code quality markers
+          BUGS=$(grep -rc "// BUG:\|// WARNING:" src/ 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+          TODOS=$(grep -rc "// TODO:\|// FIXME:\|// HACK:" src/ 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+
+          if [ "$BUGS" -gt 0 ] || [ "$TODOS" -gt 0 ]; then
+            cat >> "$GITHUB_STEP_SUMMARY" <<MARKERS
+          ### Code markers
+
+          | Type | Count |
+          |------|-------|
+          | :warning: BUG/WARNING | $BUGS |
+          | :speech_balloon: TODO/FIXME/HACK | $TODOS |
+
+          MARKERS
+          fi
+
+      # ── Final gate ───────────────────────────────────────────
+      # Fails the job if any continue-on-error step failed,
+      # so the PR check still blocks on real failures.
+      - name: Check results
+        if: always()
+        run: |
+          if [ "${{ steps.typecheck.outcome }}" = "failure" ]; then
+            echo "::error::Typecheck failed"
+            exit 1
+          fi
+          if [ "${{ steps.tests.outcome }}" = "failure" ]; then
+            echo "::error::Tests failed"
+            exit 1
+          fi
