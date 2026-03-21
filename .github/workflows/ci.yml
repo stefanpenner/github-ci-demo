@@ -1,0 +1,32 @@
+name: CI
+on: [pull_request]
+
+jobs:
+  # Step 1: Your JS action figures out what changed
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.check.outputs.matrix }}
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./.github/actions/check-packages
+        with:
+          packages-dir: packages
+          fail-on-missing-tests: 'false'  # don't block, just warn
+
+  # Step 2: Dynamic matrix — runs a job per changed package
+  test:
+    needs: check
+    if: needs.check.outputs.matrix != ''
+    strategy:
+      matrix: ${{ fromJson(needs.check.outputs.matrix) }}
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "Testing ${{ matrix.package }} in ${{ matrix.dir }}"
+          cd ${{ matrix.dir }}
+          npm test
