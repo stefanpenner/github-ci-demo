@@ -1,0 +1,18 @@
+# This file tells the runner: "this is a node20 action, run index.js"
+name: 'Check Packages'
+description: 'Detect changed packages and post annotations'
+inputs:
+  packages-dir:
+    description: 'Directory containing packages'
+    default: 'packages'
+  fail-on-missing-tests:
+    description: 'Fail if a changed package has no tests'
+    default: 'true'
+outputs:
+  changed:
+    description: 'JSON array of changed package names'
+  matrix:
+    description: 'Matrix JSON for downstream jobs'
+runs:
+  using: node20
+  main: index.js
