@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
 
 jobs:
   build:
@@ -86,6 +87,84 @@ jobs:
           done
 
           echo "::endgroup::"
+
+      # ── Check Runs API annotations ─────────────────────────────
+      # Unlike ::warning file=, Check Runs API annotations appear
+      # on ANY file — not just files changed in the PR. This is the
+      # way to annotate files that aren't part of the diff.
+      - name: Post code quality annotations via Check Runs API
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+
+            // Collect markers from source
+            const annotations = [];
+
+            const markerPatterns = [
+              { regex: /\/\/ BUG:(.*)/, level: 'warning' },
+              { regex: /\/\/ WARNING:(.*)/, level: 'warning' },
+              { regex: /\/\/ TODO:(.*)/, level: 'notice' },
+              { regex: /\/\/ FIXME:(.*)/, level: 'warning' },
+              { regex: /\/\/ HACK:(.*)/, level: 'warning' },
+            ];
+
+            const output = execSync('grep -rn "// BUG:\\|// WARNING:\\|// TODO:\\|// FIXME:\\|// HACK:" src/ || true').toString();
+
+            for (const line of output.trim().split('\n')) {
+              if (!line) continue;
+              const match = line.match(/^(.+?):(\d+):(.+)$/);
+              if (!match) continue;
+
+              const [, file, lineNum, content] = match;
+              let level = 'notice';
+              let message = content.trim();
+
+              for (const p of markerPatterns) {
+                if (p.regex.test(content)) {
+                  level = p.level;
+                  message = content.replace(/^\s*\/\/\s*/, '');
+                  break;
+                }
+              }
+
+              annotations.push({
+                path: file,
+                start_line: parseInt(lineNum),
+                end_line: parseInt(lineNum),
+                annotation_level: level,
+                message,
+              });
+            }
+
+            if (annotations.length === 0) {
+              core.info('No code markers found');
+              return;
+            }
+
+            // Check Runs API accepts max 50 annotations per call
+            const chunks = [];
+            for (let i = 0; i < annotations.length; i += 50) {
+              chunks.push(annotations.slice(i, i + 50));
+            }
+
+            for (let i = 0; i < chunks.length; i++) {
+              await github.rest.checks.create({
+                ...context.repo,
+                name: 'Code Quality Markers',
+                head_sha: context.sha,
+                status: 'completed',
+                conclusion: 'neutral',
+                output: {
+                  title: `${annotations.length} code marker(s) found`,
+                  summary: `Found ${annotations.length} BUG/WARNING/TODO/FIXME/HACK markers in source code.`,
+                  annotations: chunks[i],
+                },
+              });
+            }
+
+            core.info(`Posted ${annotations.length} annotation(s) via Check Runs API`);
 
       # ── Tests (with error extraction) ─────────────────────────
       # continue-on-error lets us capture output, then a follow-up
