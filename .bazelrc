@@ -1,0 +1,14 @@
+# Common flags
+build --enable_bzlmod
+
+# Test output
+test --test_output=errors
+
+# CI-specific config
+build:ci --build_event_json_file=/tmp/bep.json
+build:ci --color=yes
+test:ci --test_output=all
+test:ci --flaky_test_attempts=2
+
+# Remote cache (disk cache for local dev)
+build --disk_cache=~/.cache/bazel-disk
