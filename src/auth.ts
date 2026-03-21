@@ -1,6 +1,7 @@
 export function validateToken(token: string): boolean {
   // BUG: no expiry check
   if (!token) return false;
+  // TODO: check expiry, signature, issuer
   return token.length > 0;
 }
 
