@@ -77,25 +77,24 @@ jobs:
           git config user.name "mpr-bot[bot]"
           git config user.email "mpr-bot[bot]@users.noreply.github.com"
 
-          # Show what changed
-          echo "::group::Changes"
-          git diff
+          # Stage all package files (including new untracked ones)
+          git add -f package.json
+          git add package-lock.json yarn.lock pnpm-lock.yaml 2>/dev/null || true
+
+          echo "::group::Staged changes"
+          git diff --cached
           echo "::endgroup::"
 
           # Build commit message
           BUMPS=$(echo '${{ inputs.bumps }}' | jq -r '.[] | "  \(.pkg): → \(.version)"')
-          MSG=$(cat <<EOF
-          chore(mpr): bump dependencies [${{ inputs.mpr-label }}]
 
-          $BUMPS
+          git commit -m "chore(mpr): bump dependencies [${{ inputs.mpr-label }}]
+
+          ${BUMPS}
 
           Automated by MPR coordination service
-          PR: #${{ inputs.pr-number }}
-          EOF
-          )
+          PR: #${{ inputs.pr-number }}"
 
-          git add package.json package-lock.json yarn.lock pnpm-lock.yaml 2>/dev/null || true
-          git commit -m "$MSG"
           git push
 
       - name: Post updated check run
