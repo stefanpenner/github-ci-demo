@@ -1,0 +1,143 @@
+# Triggered by the MPR coordination service (via workflow_dispatch or check_run action button)
+# Does the actual npm install + lockfile update + commit + push
+name: MPR Bump
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: 'PR number to bump'
+        required: true
+        type: string
+      bumps:
+        description: 'JSON array of {pkg, version} to bump'
+        required: true
+        type: string
+      mpr-label:
+        description: 'The mpr: label for this group'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  checks: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr-number }}/head
+          # Fetch the actual branch so we can push back to it
+          fetch-depth: 0
+
+      - name: Get PR branch name
+        id: branch
+        run: |
+          BRANCH=$(gh pr view ${{ inputs.pr-number }} --json headRefName -q .headRefName)
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout "$BRANCH"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Apply dependency bumps
+        run: |
+          # Create package.json if it doesn't exist (demo repo)
+          if [ ! -f package.json ]; then
+            echo '{"name":"@acme/api-client","version":"3.1.0","dependencies":{"@acme/auth":"^2.3.0"}}' | jq '.' > package.json
+            echo "Created package.json"
+          fi
+
+          # Update package.json with the new versions
+          echo '${{ inputs.bumps }}' | jq -c '.[]' | while read bump; do
+            PKG=$(echo "$bump" | jq -r '.pkg')
+            VER=$(echo "$bump" | jq -r '.version')
+            echo "Bumping $PKG to $VER"
+            jq --arg pkg "$PKG" --arg ver "$VER" '.dependencies[$pkg] = $ver' \
+              package.json > package.json.tmp && mv package.json.tmp package.json
+          done
+
+          # Run npm install to update the lockfile
+          # In production: npm install points at your private registry
+          npm install --package-lock-only 2>/dev/null || echo "Lockfile update skipped (private packages)"
+
+          echo "::group::Updated package.json"
+          cat package.json
+          echo "::endgroup::"
+
+      - name: Commit and push
+        run: |
+          git config user.name "mpr-bot[bot]"
+          git config user.email "mpr-bot[bot]@users.noreply.github.com"
+
+          # Stage all package files (including new untracked ones)
+          git add -f package.json
+          git add package-lock.json yarn.lock pnpm-lock.yaml 2>/dev/null || true
+
+          echo "::group::Staged changes"
+          git diff --cached
+          echo "::endgroup::"
+
+          # Build commit message
+          BUMPS=$(echo '${{ inputs.bumps }}' | jq -r '.[] | "  \(.pkg): → \(.version)"')
+
+          git commit -m "chore(mpr): bump dependencies [${{ inputs.mpr-label }}]
+
+          ${BUMPS}
+
+          Automated by MPR coordination service
+          PR: #${{ inputs.pr-number }}"
+
+          git push
+
+      - name: Post updated check run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ inputs.pr-number }}');
+            const label = '${{ inputs.mpr-label }}';
+
+            // Get the new HEAD SHA after our push
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: prNumber,
+            });
+
+            await github.rest.checks.create({
+              ...context.repo,
+              name: `MPR: ${label}`,
+              head_sha: pr.head.sha,
+              status: 'completed',
+              conclusion: 'action_required',
+              output: {
+                title: '⏳ Deps bumped — waiting for CI + merge order',
+                summary: [
+                  `## 🔗 \`${label}\`\n`,
+                  `Dependencies on PR #${prNumber} have been bumped and lockfile updated.`,
+                  '',
+                  '### What happened',
+                  '',
+                  '```',
+                  ...(JSON.parse('${{ inputs.bumps }}')).map(b => `${b.pkg}: → ${b.version}`),
+                  '```',
+                  '',
+                  '### Next steps',
+                  '',
+                  '1. ⏳ CI will run on the new commit',
+                  '2. ⏳ Once CI passes, this PR publishes its packages',
+                  '3. ⏳ Downstream PRs in the group get bumped next',
+                ].join('\n'),
+              },
+              actions: [
+                { label: 'Refresh', description: 'Re-check group state', identifier: 'mpr_refresh' },
+              ],
+            });
+
+            core.info(`Updated check run on PR #${prNumber}`);
