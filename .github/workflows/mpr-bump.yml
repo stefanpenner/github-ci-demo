@@ -73,6 +73,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Commit and push
+        id: commit
         run: |
           git config user.name "mpr-bot[bot]"
           git config user.email "mpr-bot[bot]@users.noreply.github.com"
@@ -85,17 +86,59 @@ jobs:
           git diff --cached
           echo "::endgroup::"
 
+          if git diff --cached --quiet; then
+            echo "::warning::No dependency changes detected — nothing to commit"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Build commit message
           BUMPS=$(echo '${{ inputs.bumps }}' | jq -r '.[] | "  \(.pkg): → \(.version)"')
 
-          git commit -m "chore(mpr): bump dependencies [${{ inputs.mpr-label }}]
+          if ! git commit -m "chore(mpr): bump dependencies [${{ inputs.mpr-label }}]
 
           ${BUMPS}
 
           Automated by MPR coordination service
-          PR: #${{ inputs.pr-number }}"
+          PR: #${{ inputs.pr-number }}"; then
+            echo "::error::Failed to create commit for dependency bump"
+            exit 1
+          fi
 
-          git push
+          if ! git push; then
+            echo "::error::Failed to push dependency bump (branch may be protected or out of date)"
+            exit 1
+          fi
+
+      - name: Write bump summary
+        if: always()
+        run: |
+          OUTCOME="${{ steps.commit.outcome }}"
+          SKIPPED="${{ steps.commit.outputs.skipped }}"
+
+          if [ "$OUTCOME" = "success" ] && [ "$SKIPPED" != "true" ]; then
+            ICON="white_check_mark"
+            STATUS="Bumped and pushed"
+          elif [ "$SKIPPED" = "true" ]; then
+            ICON="warning"
+            STATUS="No changes detected"
+          else
+            ICON="x"
+            STATUS="Failed"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## :${ICON}: MPR Bump — ${{ inputs.mpr-label }}
+
+          **PR:** #${{ inputs.pr-number }} | **Status:** ${STATUS}
+
+          ### Dependency bumps
+
+          | Package | Version |
+          |---------|---------|
+          $(echo '${{ inputs.bumps }}' | jq -r '.[] | "| \`\(.pkg)\` | \`\(.version)\` |"')
+
+          SUMMARY
 
       - name: Post updated check run
         uses: actions/github-script@v7
