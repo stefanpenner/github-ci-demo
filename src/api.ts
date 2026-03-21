@@ -4,7 +4,11 @@ export async function handleLogin(req: Request): Promise<Response> {
   const body = await req.json();
   const { username, password } = body;
 
-  // TODO: actually validate credentials
+  // Validate credentials against auth service
+  const isValid = await verifyCredentials(username, password);
+  if (!isValid) {
+    return new Response('Invalid credentials', { status: 401 });
+  }
   const session = createSession(username);
 
   return new Response(JSON.stringify(session), {
