@@ -196,6 +196,8 @@ jobs:
 
           # If there are affected packages outside the changed set, show blast radius.
           # Otherwise show the internal dependency graph of changed packages.
+          # Disable exit-on-error for graph generation (bazel query + grep can fail)
+          set +e
           if [ -n "$RDEP_PKGS" ]; then
             # --- Blast radius mode: changed (red) + affected (amber) ---
             for dir in $CHANGED_DIRS; do
@@ -228,13 +230,12 @@ jobs:
               NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
               printf '    %s["fa:fa-cube //%s"]\n' "$NODE" "$dir" >> "$GRAPH"
             done
-            # Draw edges between changed packages based on actual deps
             for dir in $CHANGED_DIRS; do
               NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
-              DEPS_OF=$(bazel query "deps(//$dir:all, 1)" --output label 2>&1 || true)
+              DEPS_OF=$(bazel query "deps(//$dir:all, 1)" --output label 2>/dev/null)
               for other in $CHANGED_DIRS; do
                 [ "$dir" = "$other" ] && continue
-                if echo "$DEPS_OF" | grep -q "//$other:" 2>/dev/null; then
+                if echo "$DEPS_OF" | grep -q "//$other:"; then
                   OTHER_NODE=$(echo "$other" | tr '/' '_' | tr '-' '_')
                   printf '    %s --> %s\n' "$NODE" "$OTHER_NODE" >> "$GRAPH"
                 fi
@@ -245,6 +246,7 @@ jobs:
               printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
             done
           fi
+          set -e
 
           echo "has_graph=true" >> "$GITHUB_OUTPUT"
 
