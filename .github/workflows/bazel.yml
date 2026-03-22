@@ -194,37 +194,57 @@ jobs:
           done
           RDEP_PKGS=$(echo "$RDEP_PKGS" | tr ' ' '\n' | sort -u | grep -v '^$')
 
-          # Add changed packages as red nodes
-          for dir in $CHANGED_DIRS; do
-            NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
-            printf '    %s["fa:fa-cube //%s"]\n' "$NODE" "$dir" >> "$GRAPH"
-          done
-
-          # Add affected packages as amber nodes + edges
-          for pkg in $RDEP_PKGS; do
-            NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
-            printf '    %s["fa:fa-cog //%s"]\n' "$NODE" "$pkg" >> "$GRAPH"
-
-            # Find which changed package this depends on
-            for cd in $CHANGED_DIRS; do
-              CD_NODE=$(echo "$cd" | tr '/' '_' | tr '-' '_')
-              if bazel query "deps(//$pkg:all, 1)" --output label 2>/dev/null | grep -q "//$cd:"; then
-                printf '    %s --> %s\n' "$NODE" "$CD_NODE" >> "$GRAPH"
-              fi
+          # If there are affected packages outside the changed set, show blast radius.
+          # Otherwise show the internal dependency graph of changed packages.
+          if [ -n "$RDEP_PKGS" ]; then
+            # --- Blast radius mode: changed (red) + affected (amber) ---
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    %s["fa:fa-cube //%s"]\n' "$NODE" "$dir" >> "$GRAPH"
             done
-          done
 
-          # Style changed packages red
-          for dir in $CHANGED_DIRS; do
-            NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
-            printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
-          done
+            for pkg in $RDEP_PKGS; do
+              NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
+              printf '    %s["fa:fa-cog //%s"]\n' "$NODE" "$pkg" >> "$GRAPH"
+              for cd in $CHANGED_DIRS; do
+                CD_NODE=$(echo "$cd" | tr '/' '_' | tr '-' '_')
+                if bazel query "deps(//$pkg:all, 1)" --output label 2>/dev/null | grep -q "//$cd:"; then
+                  printf '    %s --> %s\n' "$NODE" "$CD_NODE" >> "$GRAPH"
+                fi
+              done
+            done
 
-          # Style affected packages amber
-          for pkg in $RDEP_PKGS; do
-            NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
-            printf '    style %s fill:#ffd43b,color:#333,stroke:#e67700\n' "$NODE" >> "$GRAPH"
-          done
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
+            done
+            for pkg in $RDEP_PKGS; do
+              NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
+              printf '    style %s fill:#ffd43b,color:#333,stroke:#e67700\n' "$NODE" >> "$GRAPH"
+            done
+          else
+            # --- Internal graph mode: show deps between changed packages ---
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    %s["fa:fa-cube //%s"]\n' "$NODE" "$dir" >> "$GRAPH"
+            done
+            # Draw edges between changed packages based on actual deps
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              DEPS_OF=$(bazel query "deps(//$dir:all, 1)" --output label 2>/dev/null || echo "")
+              for other in $CHANGED_DIRS; do
+                [ "$dir" = "$other" ] && continue
+                if echo "$DEPS_OF" | grep -q "//$other:"; then
+                  OTHER_NODE=$(echo "$other" | tr '/' '_' | tr '-' '_')
+                  printf '    %s --> %s\n' "$NODE" "$OTHER_NODE" >> "$GRAPH"
+                fi
+              done
+            done
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
+            done
+          fi
 
           echo "has_graph=true" >> "$GITHUB_OUTPUT"
 
