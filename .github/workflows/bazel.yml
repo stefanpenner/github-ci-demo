@@ -167,36 +167,32 @@ jobs:
           # Also get direct deps of changed packages (forward graph)
           FDEPS=$(bazel query "deps(set($CHANGED_PKGS), 1)" --output label 2>/dev/null || echo "")
 
-          # Build Mermaid graph
-          MERMAID="graph TD"
+          # Build Mermaid graph — write to file to avoid YAML multiline issues
+          GRAPH=/tmp/dep-graph.mermaid
+          echo "graph TD" > "$GRAPH"
 
           # Add changed packages (red)
           for pkg in $CHANGED_PKGS; do
             LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
             NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
-            MERMAID="$MERMAID
-    ${NODE}[\"📦 //${LABEL}\"]"
+            printf '    %s["pkg %s"]\n' "$NODE" "//$LABEL" >> "$GRAPH"
           done
 
           # Add reverse deps (amber) — things that DEPEND ON changed packages
           for dep in $RDEPS; do
-            # Skip the changed packages themselves, external deps, and test targets
             echo "$CHANGED_PKGS" | grep -q "$dep" && continue
             echo "$dep" | grep -q "^@" && continue
 
             LABEL=$(echo "$dep" | sed 's|//||' | sed 's/:.*$//')
             NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
-            MERMAID="$MERMAID
-    ${NODE}[\"${dep}\"]"
+            printf '    %s["%s"]\n' "$NODE" "$dep" >> "$GRAPH"
 
             # Draw edge: dependent -> changed package
             for pkg in $CHANGED_PKGS; do
               PKG_LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
               PKG_NODE=$(echo "$PKG_LABEL" | tr '/' '_' | tr '-' '_')
-              # Check if this dep actually depends on this changed pkg
               if bazel query "deps($dep, 1)" --output label 2>/dev/null | grep -q "$pkg"; then
-                MERMAID="$MERMAID
-    ${NODE} --> ${PKG_NODE}"
+                printf '    %s --> %s\n' "$NODE" "$PKG_NODE" >> "$GRAPH"
               fi
             done
           done
@@ -205,8 +201,7 @@ jobs:
           for pkg in $CHANGED_PKGS; do
             LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
             NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
-            MERMAID="$MERMAID
-    style ${NODE} fill:#ff6b6b,color:#fff,stroke:#c92a2a"
+            printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
           done
 
           # Style reverse deps amber
@@ -215,12 +210,8 @@ jobs:
             echo "$dep" | grep -q "^@" && continue
             LABEL=$(echo "$dep" | sed 's|//||' | sed 's/:.*$//')
             NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
-            MERMAID="$MERMAID
-    style ${NODE} fill:#ffd43b,color:#333,stroke:#e67700"
+            printf '    style %s fill:#ffd43b,color:#333,stroke:#e67700\n' "$NODE" >> "$GRAPH"
           done
-
-          # Save for later steps (use file because multiline)
-          echo "$MERMAID" > /tmp/dep-graph.mermaid
           echo "has_graph=true" >> "$GITHUB_OUTPUT"
 
           RDEP_COUNT=$(echo "$RDEPS" | grep -v '^$' | wc -l | tr -d ' ')

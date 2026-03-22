@@ -268,10 +268,10 @@ jobs:
           echo "affected_count=$AFFECTED_COUNT" >> "$GITHUB_OUTPUT"
           echo "test_count=$TEST_COUNT" >> "$GITHUB_OUTPUT"
 
-          # Build Mermaid graph
-          MERMAID="graph TD"
-          MERMAID="$MERMAID
-    ext_dep[\"📦 @${DEP}\"]"
+          # Build Mermaid graph — write to file to avoid YAML multiline issues
+          GRAPH=/tmp/blast-radius.mermaid
+          echo "graph TD" > "$GRAPH"
+          printf '    ext_dep["pkg @%s"]\n' "$DEP" >> "$GRAPH"
 
           # Collect unique packages
           PACKAGES=""
@@ -285,26 +285,19 @@ jobs:
             NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
             IS_TEST=$(echo "$AFFECTED" | grep "$pkg" | grep '_test$' | head -1)
             if [ -n "$IS_TEST" ]; then
-              MERMAID="$MERMAID
-    ${NODE}[\"🧪 //${pkg}\"]"
+              printf '    %s["test //%s"]\n' "$NODE" "$pkg" >> "$GRAPH"
             else
-              MERMAID="$MERMAID
-    ${NODE}[\"📄 //${pkg}\"]"
+              printf '    %s["lib //%s"]\n' "$NODE" "$pkg" >> "$GRAPH"
             fi
-            MERMAID="$MERMAID
-    ${NODE} --> ext_dep"
+            printf '    %s --> ext_dep\n' "$NODE" >> "$GRAPH"
           done
 
-          MERMAID="$MERMAID
-    style ext_dep fill:#4c6ef5,color:#fff,stroke:#364fc7"
+          printf '    style ext_dep fill:#4c6ef5,color:#fff,stroke:#364fc7\n' >> "$GRAPH"
 
           for pkg in $PACKAGES; do
             NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
-            MERMAID="$MERMAID
-    style ${NODE} fill:#ffd43b,color:#333,stroke:#e67700"
+            printf '    style %s fill:#ffd43b,color:#333,stroke:#e67700\n' "$NODE" >> "$GRAPH"
           done
-
-          echo "$MERMAID" > /tmp/blast-radius.mermaid
           echo "has_graph=true" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
