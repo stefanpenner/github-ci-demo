@@ -231,10 +231,10 @@ jobs:
             # Draw edges between changed packages based on actual deps
             for dir in $CHANGED_DIRS; do
               NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
-              DEPS_OF=$(bazel query "deps(//$dir:all, 1)" --output label 2>/dev/null || echo "")
+              DEPS_OF=$(bazel query "deps(//$dir:all, 1)" --output label 2>&1 || true)
               for other in $CHANGED_DIRS; do
                 [ "$dir" = "$other" ] && continue
-                if echo "$DEPS_OF" | grep -q "//$other:"; then
+                if echo "$DEPS_OF" | grep -q "//$other:" 2>/dev/null; then
                   OTHER_NODE=$(echo "$other" | tr '/' '_' | tr '-' '_')
                   printf '    %s --> %s\n' "$NODE" "$OTHER_NODE" >> "$GRAPH"
                 fi
