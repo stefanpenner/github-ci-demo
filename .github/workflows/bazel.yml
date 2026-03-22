@@ -192,7 +192,7 @@ jobs:
               RDEP_PKGS="$RDEP_PKGS $PKG"
             fi
           done
-          RDEP_PKGS=$(echo "$RDEP_PKGS" | tr ' ' '\n' | sort -u | grep -v '^$')
+          RDEP_PKGS=$(echo "$RDEP_PKGS" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
 
           # If there are affected packages outside the changed set, show blast radius.
           # Otherwise show the internal dependency graph of changed packages.
