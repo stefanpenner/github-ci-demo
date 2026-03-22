@@ -1,0 +1,702 @@
+# Bazel CI with deep GitHub PR integration:
+#   - Build Event Protocol (BEP) parsing for structured results
+#   - Check Runs API with file-level annotations on compile/test failures
+#   - Per-package status checks (auth, pipeline, queue)
+#   - PR comment with build dashboard (cache rate, slow tests, target count)
+#   - Flaky test detection + auto-labeling
+#   - Affected targets detection (only test what changed)
+#   - $GITHUB_STEP_SUMMARY with rich results table
+
+name: Bazel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  bazel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for affected target detection
+
+      # ── Bazel setup ──────────────────────────────────────────
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazel-disk
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', '.bazelversion') }}-${{ github.sha }}
+          restore-keys: |
+            bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', '.bazelversion') }}-
+            bazel-${{ runner.os }}-
+
+      # ── Find affected targets (PRs only) ─────────────────────
+      - name: Detect affected targets
+        id: affected
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+
+          # Get changed files
+          CHANGED=$(git diff --name-only "$BASE_SHA"...HEAD)
+          echo "::group::Changed files"
+          echo "$CHANGED"
+          echo "::endgroup::"
+
+          if [ -z "$CHANGED" ]; then
+            echo "targets=//..." >> "$GITHUB_OUTPUT"
+            echo "description=all targets (no file changes detected)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Map changed files to Bazel packages
+          PACKAGES=""
+          while IFS= read -r file; do
+            dir=$(dirname "$file")
+            # Walk up to find a BUILD file
+            while [ "$dir" != "." ]; do
+              if [ -f "$dir/BUILD.bazel" ] || [ -f "$dir/BUILD" ]; then
+                PACKAGES="$PACKAGES //$dir/..."
+                break
+              fi
+              dir=$(dirname "$dir")
+            done
+          done <<< "$CHANGED"
+
+          # Also include root if top-level files changed
+          if echo "$CHANGED" | grep -qE '^(MODULE\.bazel|BUILD\.bazel|go\.mod|\.bazelrc)'; then
+            PACKAGES="//..."
+          fi
+
+          # Deduplicate
+          TARGETS=$(echo "$PACKAGES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+          if [ -z "$TARGETS" ]; then
+            TARGETS="//..."
+          fi
+
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "description=affected targets: $TARGETS" >> "$GITHUB_OUTPUT"
+          echo "::notice::Affected targets: $TARGETS"
+
+      # ── Build ────────────────────────────────────────────────
+      - name: Bazel build
+        id: build
+        run: |
+          TARGETS="${{ steps.affected.outputs.targets || '//...' }}"
+
+          echo "::group::bazel build $TARGETS"
+          bazel build --config=ci $TARGETS 2>&1 | tee /tmp/bazel-build.log
+          EXIT=${PIPESTATUS[0]}
+          echo "::endgroup::"
+
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          exit $EXIT
+        continue-on-error: true
+
+      # ── Test ─────────────────────────────────────────────────
+      - name: Bazel test
+        id: test
+        run: |
+          TARGETS="${{ steps.affected.outputs.targets || '//...' }}"
+
+          echo "::group::bazel test $TARGETS"
+          bazel test --config=ci $TARGETS 2>&1 | tee /tmp/bazel-test.log
+          EXIT=${PIPESTATUS[0]}
+          echo "::endgroup::"
+
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          exit $EXIT
+        continue-on-error: true
+
+      # ── Dependency graph (blast radius) ─────────────────────
+      # Uses `bazel query` to map the full reverse-dependency graph
+      # of changed packages, then converts to Mermaid for the PR comment.
+      - name: Generate dependency graph
+        id: depgraph
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA"...HEAD)
+
+          # Find which Bazel packages were directly changed
+          CHANGED_PKGS=""
+          while IFS= read -r file; do
+            dir=$(dirname "$file")
+            while [ "$dir" != "." ]; do
+              if [ -f "$dir/BUILD.bazel" ] || [ -f "$dir/BUILD" ]; then
+                CHANGED_PKGS="$CHANGED_PKGS //$dir:all"
+                break
+              fi
+              dir=$(dirname "$dir")
+            done
+          done <<< "$CHANGED_FILES"
+
+          CHANGED_PKGS=$(echo "$CHANGED_PKGS" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
+
+          if [ -z "$CHANGED_PKGS" ]; then
+            echo "mermaid=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::group::Changed packages: $CHANGED_PKGS"
+          echo "$CHANGED_PKGS"
+          echo "::endgroup::"
+
+          # Query the reverse dependency graph
+          # allpaths gives us edges: what depends on the changed packages
+          QUERY_EXPR="rdeps(//..., set($CHANGED_PKGS))"
+
+          echo "::group::bazel query $QUERY_EXPR"
+          RDEPS=$(bazel query "$QUERY_EXPR" --output label 2>/dev/null || echo "")
+          echo "$RDEPS"
+          echo "::endgroup::"
+
+          # Also get direct deps of changed packages (forward graph)
+          FDEPS=$(bazel query "deps(set($CHANGED_PKGS), 1)" --output label 2>/dev/null || echo "")
+
+          # Build Mermaid graph — write to file to avoid YAML multiline issues
+          GRAPH=/tmp/dep-graph.mermaid
+          echo "graph TD" > "$GRAPH"
+
+          # Extract package paths from changed packages (strip :all)
+          CHANGED_DIRS=""
+          for pkg in $CHANGED_PKGS; do
+            DIR=$(echo "$pkg" | sed 's/:all$//' | sed 's|^//||')
+            CHANGED_DIRS="$CHANGED_DIRS $DIR"
+          done
+
+          # Collect all rdep targets into unique packages, excluding changed ones
+          RDEP_PKGS=""
+          for dep in $RDEPS; do
+            echo "$dep" | grep -q "^@" && continue
+            PKG=$(echo "$dep" | sed 's|^//||' | sed 's/:.*$//')
+            # Skip if this package is one of the changed packages
+            IS_CHANGED=false
+            for cd in $CHANGED_DIRS; do
+              if [ "$PKG" = "$cd" ]; then IS_CHANGED=true; break; fi
+            done
+            if [ "$IS_CHANGED" = "false" ]; then
+              RDEP_PKGS="$RDEP_PKGS $PKG"
+            fi
+          done
+          RDEP_PKGS=$(echo "$RDEP_PKGS" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+
+          # If there are affected packages outside the changed set, show blast radius.
+          # Otherwise show the internal dependency graph of changed packages.
+          # Disable exit-on-error for graph generation (bazel query + grep can fail)
+          set +e
+          if [ -n "$RDEP_PKGS" ]; then
+            # --- Blast radius mode: changed (red) + affected (amber) ---
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    %s["fa:fa-cube //%s"]\n' "$NODE" "$dir" >> "$GRAPH"
+            done
+
+            for pkg in $RDEP_PKGS; do
+              NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
+              printf '    %s["fa:fa-cog //%s"]\n' "$NODE" "$pkg" >> "$GRAPH"
+              for cd in $CHANGED_DIRS; do
+                CD_NODE=$(echo "$cd" | tr '/' '_' | tr '-' '_')
+                if bazel query "deps(//$pkg:all, 1)" --output label 2>/dev/null | grep -q "//$cd:"; then
+                  printf '    %s --> %s\n' "$NODE" "$CD_NODE" >> "$GRAPH"
+                fi
+              done
+            done
+
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
+            done
+            for pkg in $RDEP_PKGS; do
+              NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
+              printf '    style %s fill:#ffd43b,color:#333,stroke:#e67700\n' "$NODE" >> "$GRAPH"
+            done
+          else
+            # --- Internal graph mode: show deps between changed packages ---
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    %s["fa:fa-cube //%s"]\n' "$NODE" "$dir" >> "$GRAPH"
+            done
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              DEPS_OF=$(bazel query "deps(//$dir:all, 1)" --output label 2>/dev/null)
+              for other in $CHANGED_DIRS; do
+                [ "$dir" = "$other" ] && continue
+                if echo "$DEPS_OF" | grep -q "//$other:"; then
+                  OTHER_NODE=$(echo "$other" | tr '/' '_' | tr '-' '_')
+                  printf '    %s --> %s\n' "$NODE" "$OTHER_NODE" >> "$GRAPH"
+                fi
+              done
+            done
+            for dir in $CHANGED_DIRS; do
+              NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+              printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
+            done
+          fi
+          set -e
+
+          echo "has_graph=true" >> "$GITHUB_OUTPUT"
+
+          RDEP_COUNT=$(echo "$RDEPS" | grep -v '^$' | wc -l | tr -d ' ')
+          echo "rdep_count=$RDEP_COUNT" >> "$GITHUB_OUTPUT"
+          echo "changed_pkgs=$CHANGED_PKGS" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Blast radius: $RDEP_COUNT targets affected by changes to $CHANGED_PKGS"
+        continue-on-error: true
+
+      # ── Parse BEP + Post Check Runs ─────────────────────────
+      - name: Parse BEP and post results
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const headSha = process.env.HEAD_SHA;
+
+            // ── Parse BEP ─────────────────────────────────────
+            let events = [];
+            try {
+              const raw = fs.readFileSync('/tmp/bep.json', 'utf8').trim();
+              events = raw.split('\n').filter(Boolean).map(l => JSON.parse(l));
+            } catch (e) {
+              core.warning(`Could not parse BEP file: ${e.message}`);
+              return;
+            }
+
+            core.info(`Parsed ${events.length} BEP events`);
+
+            // ── Collect test results ──────────────────────────
+            const testResults = [];
+            const annotations = [];
+            const actionStats = { total: 0, cached: 0 };
+            const packageResults = {};  // package -> [results]
+
+            for (const event of events) {
+              // Count actions for cache stats
+              if (event.id?.actionCompleted) {
+                actionStats.total++;
+                // Remote cache hits have strategy "remote cache hit"
+                const strategy = event.action?.strategy || '';
+                if (strategy.includes('cache') || event.action?.type === 'REMOTE_CACHE_HIT') {
+                  actionStats.cached++;
+                }
+              }
+
+              // Test results
+              if (event.id?.testResult) {
+                const label = event.id.testResult.label;
+                const status = event.testResult?.status || 'UNKNOWN';
+                const durationMs = parseInt(event.testResult?.testAttemptDurationMillis || '0');
+                const pkg = label.replace(/\/\/([^:]+):.*/, '$1');
+
+                testResults.push({ label, status, durationMs, pkg });
+
+                if (!packageResults[pkg]) packageResults[pkg] = [];
+                packageResults[pkg].push({ label, status });
+
+                // Extract failure details from test logs
+                if (status === 'FAILED' || status === 'TIMEOUT') {
+                  const outputs = event.testResult?.testActionOutput || [];
+                  for (const output of outputs) {
+                    if (output.name === 'test.log') {
+                      const logUri = output.uri || '';
+                      const logPath = logUri.replace('file://', '');
+                      try {
+                        const log = fs.readFileSync(logPath, 'utf8');
+                        // Parse Go test failures: filename:line: message
+                        const matches = [...log.matchAll(/^\s*(\S+\.go):(\d+):\s*(.+)/gm)];
+                        for (const m of matches) {
+                          annotations.push({
+                            path: findRepoPath(m[1]),
+                            start_line: parseInt(m[2]),
+                            end_line: parseInt(m[2]),
+                            annotation_level: 'failure',
+                            message: `[${label}] ${m[3]}`,
+                          });
+                        }
+                      } catch (e) {
+                        core.info(`Could not read test log ${logPath}: ${e.message}`);
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Build failures with file:line
+              if (event.id?.actionCompleted && event.action?.success === false) {
+                const stderr = event.action?.stderr;
+                if (stderr?.uri) {
+                  try {
+                    const log = fs.readFileSync(stderr.uri.replace('file://', ''), 'utf8');
+                    const matches = [...log.matchAll(/(\S+\.go):(\d+):(\d+):\s*(.*)/g)];
+                    for (const m of matches) {
+                      annotations.push({
+                        path: findRepoPath(m[1]),
+                        start_line: parseInt(m[2]),
+                        end_line: parseInt(m[2]),
+                        annotation_level: 'failure',
+                        message: m[4],
+                      });
+                    }
+                  } catch {}
+                }
+              }
+            }
+
+            // Helper: resolve sandbox paths back to repo-relative paths
+            function findRepoPath(sandboxPath) {
+              // Bazel sandbox paths look like: .../execroot/__main__/internal/auth/auth.go
+              // or just the filename from test output
+              const parts = sandboxPath.split('/');
+              const filename = parts[parts.length - 1];
+
+              // Try to find it relative to common prefixes
+              for (const prefix of ['internal/', 'cmd/', 'pkg/']) {
+                const idx = sandboxPath.indexOf(prefix);
+                if (idx >= 0) return sandboxPath.slice(idx);
+              }
+              return sandboxPath;
+            }
+
+            // ── Summary stats ─────────────────────────────────
+            const passed = testResults.filter(t => t.status === 'PASSED').length;
+            const failed = testResults.filter(t => t.status === 'FAILED').length;
+            const flaky = testResults.filter(t => t.status === 'FLAKY').length;
+            const timeout = testResults.filter(t => t.status === 'TIMEOUT').length;
+            const cacheRate = actionStats.total > 0
+              ? ((actionStats.cached / actionStats.total) * 100).toFixed(1)
+              : '0';
+            const slowTests = testResults
+              .filter(t => t.durationMs > 5000)
+              .sort((a, b) => b.durationMs - a.durationMs);
+
+            const allPassed = failed === 0 && timeout === 0;
+
+            // ── Post main Check Run ───────────────────────────
+            const statusIcon = (s) => {
+              switch(s) {
+                case 'PASSED': return '✅';
+                case 'FAILED': return '❌';
+                case 'FLAKY': return '⚠️';
+                case 'TIMEOUT': return '⏰';
+                default: return '❓';
+              }
+            };
+
+            const testTable = testResults.length > 0
+              ? '| | Target | Status | Duration |\n|--|--------|--------|----------|\n' +
+                testResults.map(t =>
+                  `| ${statusIcon(t.status)} | \`${t.label}\` | ${t.status} | ${(t.durationMs/1000).toFixed(1)}s |`
+                ).join('\n')
+              : '_No test targets found._';
+
+            // Chunk annotations (50 per API call)
+            const chunks = [];
+            for (let i = 0; i < annotations.length; i += 50) {
+              chunks.push(annotations.slice(i, i + 50));
+            }
+
+            // Create check run (first chunk or empty)
+            await github.rest.checks.create({
+              ...context.repo,
+              name: 'Bazel Build & Test',
+              head_sha: headSha,
+              status: 'completed',
+              conclusion: allPassed ? 'success' : 'failure',
+              output: {
+                title: allPassed
+                  ? `✅ ${passed} tests passed (${cacheRate}% cache hit)`
+                  : `❌ ${failed} failed, ${passed} passed`,
+                summary: [
+                  '## Test Results\n',
+                  `| Metric | Value |`,
+                  `|--------|-------|`,
+                  `| Total targets | ${testResults.length} |`,
+                  `| ✅ Passed | ${passed} |`,
+                  `| ❌ Failed | ${failed} |`,
+                  `| ⚠️ Flaky | ${flaky} |`,
+                  `| ⏰ Timeout | ${timeout} |`,
+                  `| Cache hit rate | ${cacheRate}% (${actionStats.cached}/${actionStats.total} actions) |`,
+                  '',
+                  '## Targets\n',
+                  testTable,
+                ].join('\n'),
+                annotations: chunks[0] || [],
+              },
+            });
+
+            // Post additional annotation chunks
+            for (let i = 1; i < chunks.length; i++) {
+              await github.rest.checks.create({
+                ...context.repo,
+                name: `Bazel Annotations (${i+1})`,
+                head_sha: headSha,
+                status: 'completed',
+                conclusion: 'neutral',
+                output: {
+                  title: `Additional annotations (batch ${i+1})`,
+                  summary: `Annotations batch ${i+1} of ${chunks.length}`,
+                  annotations: chunks[i],
+                },
+              });
+            }
+
+            // ── Per-package Check Runs ────────────────────────
+            for (const [pkg, results] of Object.entries(packageResults)) {
+              const pkgPassed = results.every(r => r.status === 'PASSED' || r.status === 'FLAKY');
+              const pkgName = pkg.replace('internal/', '').replace('cmd/', '');
+
+              await github.rest.checks.create({
+                ...context.repo,
+                name: `Bazel: ${pkgName}`,
+                head_sha: headSha,
+                status: 'completed',
+                conclusion: pkgPassed ? 'success' : 'failure',
+                output: {
+                  title: pkgPassed
+                    ? `${results.length} tests passed`
+                    : `Failures in ${pkgName}`,
+                  summary: results.map(r =>
+                    `${statusIcon(r.status)} \`${r.label}\` — ${r.status}`
+                  ).join('\n'),
+                },
+              });
+            }
+
+            // ── Export for later steps ────────────────────────
+            core.exportVariable('BAZEL_PASSED', passed);
+            core.exportVariable('BAZEL_FAILED', failed);
+            core.exportVariable('BAZEL_FLAKY', flaky);
+            core.exportVariable('BAZEL_CACHE_RATE', cacheRate);
+            core.exportVariable('BAZEL_TOTAL_ACTIONS', actionStats.total);
+            core.exportVariable('BAZEL_CACHED_ACTIONS', actionStats.cached);
+            core.exportVariable('BAZEL_TEST_COUNT', testResults.length);
+            core.exportVariable('BAZEL_SLOW_TESTS', JSON.stringify(slowTests));
+            core.exportVariable('BAZEL_FLAKY_TARGETS', JSON.stringify(
+              testResults.filter(t => t.status === 'FLAKY').map(t => t.label)
+            ));
+
+      # ── PR Comment with build dashboard ─────────────────────
+      - name: Post PR build dashboard
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        with:
+          script: |
+            const headSha = process.env.HEAD_SHA;
+            const passed = parseInt(process.env.BAZEL_PASSED || '0');
+            const failed = parseInt(process.env.BAZEL_FAILED || '0');
+            const flaky = parseInt(process.env.BAZEL_FLAKY || '0');
+            const cacheRate = process.env.BAZEL_CACHE_RATE || '0';
+            const totalActions = process.env.BAZEL_TOTAL_ACTIONS || '0';
+            const cachedActions = process.env.BAZEL_CACHED_ACTIONS || '0';
+            const testCount = process.env.BAZEL_TEST_COUNT || '0';
+            const affected = '${{ steps.affected.outputs.description || 'all targets' }}';
+            const hasGraph = '${{ steps.depgraph.outputs.has_graph }}' === 'true';
+            const rdepCount = '${{ steps.depgraph.outputs.rdep_count }}' || '0';
+            const changedPkgs = '${{ steps.depgraph.outputs.changed_pkgs }}' || '';
+
+            // Read Mermaid graph if available
+            let mermaidSection = '';
+            if (hasGraph) {
+              try {
+                const fs = require('fs');
+                const mermaid = fs.readFileSync('/tmp/dep-graph.mermaid', 'utf8');
+                mermaidSection = [
+                  '\n### 🔍 Blast Radius\n',
+                  `Changed: \`${changedPkgs.trim()}\` · **${rdepCount} targets affected**\n`,
+                  '> 🔴 Changed packages · 🟡 Affected dependents\n',
+                  '```mermaid',
+                  mermaid,
+                  '```',
+                ].join('\n');
+              } catch {}
+            }
+
+            let slowSection = '';
+            try {
+              const slowTests = JSON.parse(process.env.BAZEL_SLOW_TESTS || '[]');
+              if (slowTests.length > 0) {
+                slowSection = [
+                  '\n### 🐌 Slow tests (>5s)\n',
+                  '| Target | Duration |',
+                  '|--------|----------|',
+                  ...slowTests.slice(0, 10).map(t =>
+                    `| \`${t.label}\` | ${(t.durationMs/1000).toFixed(1)}s |`
+                  ),
+                ].join('\n');
+              }
+            } catch {}
+
+            let flakySection = '';
+            try {
+              const flakyTargets = JSON.parse(process.env.BAZEL_FLAKY_TARGETS || '[]');
+              if (flakyTargets.length > 0) {
+                flakySection = [
+                  '\n### ⚠️ Flaky tests\n',
+                  'These passed on retry but failed on first attempt:',
+                  ...flakyTargets.map(t => `- \`${t}\``),
+                  '',
+                  'Reproduce locally:',
+                  '```bash',
+                  `bazel test --runs_per_test=10 ${flakyTargets[0]}`,
+                  '```',
+                ].join('\n');
+              }
+            } catch {}
+
+            const allPassed = failed === 0;
+            const icon = allPassed ? '✅' : '❌';
+
+            const body = [
+              `## ${icon} Bazel Build Report\n`,
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Scope | ${affected} |`,
+              `| Test targets | ${testCount} |`,
+              `| ✅ Passed | ${passed} |`,
+              `| ❌ Failed | ${failed} |`,
+              `| ⚠️ Flaky | ${flaky} |`,
+              `| Cache hit rate | ${cacheRate}% (${cachedActions}/${totalActions} actions) |`,
+              mermaidSection,
+              slowSection,
+              flakySection,
+              '\n---',
+              `<sub>🏗️ Built with Bazel · Commit ${headSha.slice(0, 7)}</sub>`,
+              '\n<!-- bazel-build-report -->',
+            ].join('\n');
+
+            // Upsert: update existing comment or create new
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body?.includes('<!-- bazel-build-report -->'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing PR comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              core.info('Created new PR comment');
+            }
+
+      # ── Flaky test labeling ─────────────────────────────────
+      - name: Label flaky tests
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const flakyTargets = JSON.parse(process.env.BAZEL_FLAKY_TARGETS || '[]');
+              if (flakyTargets.length > 0) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: context.issue.number,
+                  labels: ['flaky-tests'],
+                });
+                core.info(`Added flaky-tests label (${flakyTargets.length} flaky targets)`);
+              }
+            } catch (e) {
+              core.info(`Could not add label: ${e.message}`);
+            }
+
+      # ── Upload BEP + test logs as artifacts ─────────────────
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-bep-${{ github.sha }}
+          path: /tmp/bep.json
+          if-no-files-found: ignore
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-testlogs-${{ github.sha }}
+          path: |
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.xml
+          if-no-files-found: ignore
+
+      # ── Step summary ────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          BUILD="${{ steps.build.outcome }}"
+          TEST="${{ steps.test.outcome }}"
+          PASSED="${BAZEL_PASSED:-0}"
+          FAILED="${BAZEL_FAILED:-0}"
+          FLAKY="${BAZEL_FLAKY:-0}"
+          CACHE_RATE="${BAZEL_CACHE_RATE:-N/A}"
+          TARGETS="${{ steps.affected.outputs.description || 'all targets' }}"
+
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              *) echo "➖" ;;
+            esac
+          }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## 🏗️ Bazel CI Results
+
+          | Step | Result |
+          |------|--------|
+          | Build | $(icon "$BUILD") $BUILD |
+          | Test | $(icon "$TEST") $TEST |
+
+          ### Targets
+
+          $TARGETS
+
+          ### Test Summary
+
+          | Metric | Count |
+          |--------|-------|
+          | ✅ Passed | $PASSED |
+          | ❌ Failed | $FAILED |
+          | ⚠️ Flaky | $FLAKY |
+          | Cache hit | ${CACHE_RATE}% |
+
+          SUMMARY
+
+      # ── Final gate ──────────────────────────────────────────
+      - name: Check results
+        if: always()
+        run: |
+          if [ "${{ steps.build.outcome }}" = "failure" ]; then
+            echo "::error::Bazel build failed"
+            exit 1
+          fi
+          if [ "${{ steps.test.outcome }}" = "failure" ]; then
+            echo "::error::Bazel tests failed"
+            exit 1
+          fi
