@@ -171,47 +171,61 @@ jobs:
           GRAPH=/tmp/dep-graph.mermaid
           echo "graph TD" > "$GRAPH"
 
-          # Add changed packages (red)
+          # Extract package paths from changed packages (strip :all)
+          CHANGED_DIRS=""
           for pkg in $CHANGED_PKGS; do
-            LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
-            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
-            printf '    %s["pkg %s"]\n' "$NODE" "//$LABEL" >> "$GRAPH"
+            DIR=$(echo "$pkg" | sed 's/:all$//' | sed 's|^//||')
+            CHANGED_DIRS="$CHANGED_DIRS $DIR"
           done
 
-          # Add reverse deps (amber) — things that DEPEND ON changed packages
+          # Collect all rdep targets into unique packages, excluding changed ones
+          RDEP_PKGS=""
           for dep in $RDEPS; do
-            echo "$CHANGED_PKGS" | grep -q "$dep" && continue
             echo "$dep" | grep -q "^@" && continue
+            PKG=$(echo "$dep" | sed 's|^//||' | sed 's/:.*$//')
+            # Skip if this package is one of the changed packages
+            IS_CHANGED=false
+            for cd in $CHANGED_DIRS; do
+              if [ "$PKG" = "$cd" ]; then IS_CHANGED=true; break; fi
+            done
+            if [ "$IS_CHANGED" = "false" ]; then
+              RDEP_PKGS="$RDEP_PKGS $PKG"
+            fi
+          done
+          RDEP_PKGS=$(echo "$RDEP_PKGS" | tr ' ' '\n' | sort -u | grep -v '^$')
 
-            LABEL=$(echo "$dep" | sed 's|//||' | sed 's/:.*$//')
-            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
-            printf '    %s["%s"]\n' "$NODE" "$dep" >> "$GRAPH"
+          # Add changed packages as red nodes
+          for dir in $CHANGED_DIRS; do
+            NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
+            printf '    %s["fa:fa-cube //%s"]\n' "$NODE" "$dir" >> "$GRAPH"
+          done
 
-            # Draw edge: dependent -> changed package
-            for pkg in $CHANGED_PKGS; do
-              PKG_LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
-              PKG_NODE=$(echo "$PKG_LABEL" | tr '/' '_' | tr '-' '_')
-              if bazel query "deps($dep, 1)" --output label 2>/dev/null | grep -q "$pkg"; then
-                printf '    %s --> %s\n' "$NODE" "$PKG_NODE" >> "$GRAPH"
+          # Add affected packages as amber nodes + edges
+          for pkg in $RDEP_PKGS; do
+            NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
+            printf '    %s["fa:fa-cog //%s"]\n' "$NODE" "$pkg" >> "$GRAPH"
+
+            # Find which changed package this depends on
+            for cd in $CHANGED_DIRS; do
+              CD_NODE=$(echo "$cd" | tr '/' '_' | tr '-' '_')
+              if bazel query "deps(//$pkg:all, 1)" --output label 2>/dev/null | grep -q "//$cd:"; then
+                printf '    %s --> %s\n' "$NODE" "$CD_NODE" >> "$GRAPH"
               fi
             done
           done
 
-          # Style the changed packages red
-          for pkg in $CHANGED_PKGS; do
-            LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
-            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
+          # Style changed packages red
+          for dir in $CHANGED_DIRS; do
+            NODE=$(echo "$dir" | tr '/' '_' | tr '-' '_')
             printf '    style %s fill:#ff6b6b,color:#fff,stroke:#c92a2a\n' "$NODE" >> "$GRAPH"
           done
 
-          # Style reverse deps amber
-          for dep in $RDEPS; do
-            echo "$CHANGED_PKGS" | grep -q "$dep" && continue
-            echo "$dep" | grep -q "^@" && continue
-            LABEL=$(echo "$dep" | sed 's|//||' | sed 's/:.*$//')
-            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
+          # Style affected packages amber
+          for pkg in $RDEP_PKGS; do
+            NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
             printf '    style %s fill:#ffd43b,color:#333,stroke:#e67700\n' "$NODE" >> "$GRAPH"
           done
+
           echo "has_graph=true" >> "$GITHUB_OUTPUT"
 
           RDEP_COUNT=$(echo "$RDEPS" | grep -v '^$' | wc -l | tr -d ' ')
