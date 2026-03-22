@@ -121,6 +121,115 @@ jobs:
           exit $EXIT
         continue-on-error: true
 
+      # ── Dependency graph (blast radius) ─────────────────────
+      # Uses `bazel query` to map the full reverse-dependency graph
+      # of changed packages, then converts to Mermaid for the PR comment.
+      - name: Generate dependency graph
+        id: depgraph
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA"...HEAD)
+
+          # Find which Bazel packages were directly changed
+          CHANGED_PKGS=""
+          while IFS= read -r file; do
+            dir=$(dirname "$file")
+            while [ "$dir" != "." ]; do
+              if [ -f "$dir/BUILD.bazel" ] || [ -f "$dir/BUILD" ]; then
+                CHANGED_PKGS="$CHANGED_PKGS //$dir:all"
+                break
+              fi
+              dir=$(dirname "$dir")
+            done
+          done <<< "$CHANGED_FILES"
+
+          CHANGED_PKGS=$(echo "$CHANGED_PKGS" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
+
+          if [ -z "$CHANGED_PKGS" ]; then
+            echo "mermaid=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::group::Changed packages: $CHANGED_PKGS"
+          echo "$CHANGED_PKGS"
+          echo "::endgroup::"
+
+          # Query the reverse dependency graph
+          # allpaths gives us edges: what depends on the changed packages
+          QUERY_EXPR="rdeps(//..., set($CHANGED_PKGS))"
+
+          echo "::group::bazel query $QUERY_EXPR"
+          RDEPS=$(bazel query "$QUERY_EXPR" --output label 2>/dev/null || echo "")
+          echo "$RDEPS"
+          echo "::endgroup::"
+
+          # Also get direct deps of changed packages (forward graph)
+          FDEPS=$(bazel query "deps(set($CHANGED_PKGS), 1)" --output label 2>/dev/null || echo "")
+
+          # Build Mermaid graph
+          MERMAID="graph TD"
+
+          # Add changed packages (red)
+          for pkg in $CHANGED_PKGS; do
+            LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
+            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
+            MERMAID="$MERMAID
+    ${NODE}[\"📦 //${LABEL}\"]"
+          done
+
+          # Add reverse deps (amber) — things that DEPEND ON changed packages
+          for dep in $RDEPS; do
+            # Skip the changed packages themselves, external deps, and test targets
+            echo "$CHANGED_PKGS" | grep -q "$dep" && continue
+            echo "$dep" | grep -q "^@" && continue
+
+            LABEL=$(echo "$dep" | sed 's|//||' | sed 's/:.*$//')
+            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
+            MERMAID="$MERMAID
+    ${NODE}[\"${dep}\"]"
+
+            # Draw edge: dependent -> changed package
+            for pkg in $CHANGED_PKGS; do
+              PKG_LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
+              PKG_NODE=$(echo "$PKG_LABEL" | tr '/' '_' | tr '-' '_')
+              # Check if this dep actually depends on this changed pkg
+              if bazel query "deps($dep, 1)" --output label 2>/dev/null | grep -q "$pkg"; then
+                MERMAID="$MERMAID
+    ${NODE} --> ${PKG_NODE}"
+              fi
+            done
+          done
+
+          # Style the changed packages red
+          for pkg in $CHANGED_PKGS; do
+            LABEL=$(echo "$pkg" | sed 's/:all$//' | sed 's|//||')
+            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
+            MERMAID="$MERMAID
+    style ${NODE} fill:#ff6b6b,color:#fff,stroke:#c92a2a"
+          done
+
+          # Style reverse deps amber
+          for dep in $RDEPS; do
+            echo "$CHANGED_PKGS" | grep -q "$dep" && continue
+            echo "$dep" | grep -q "^@" && continue
+            LABEL=$(echo "$dep" | sed 's|//||' | sed 's/:.*$//')
+            NODE=$(echo "$LABEL" | tr '/' '_' | tr '-' '_')
+            MERMAID="$MERMAID
+    style ${NODE} fill:#ffd43b,color:#333,stroke:#e67700"
+          done
+
+          # Save for later steps (use file because multiline)
+          echo "$MERMAID" > /tmp/dep-graph.mermaid
+          echo "has_graph=true" >> "$GITHUB_OUTPUT"
+
+          RDEP_COUNT=$(echo "$RDEPS" | grep -v '^$' | wc -l | tr -d ' ')
+          echo "rdep_count=$RDEP_COUNT" >> "$GITHUB_OUTPUT"
+          echo "changed_pkgs=$CHANGED_PKGS" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Blast radius: $RDEP_COUNT targets affected by changes to $CHANGED_PKGS"
+        continue-on-error: true
+
       # ── Parse BEP + Post Check Runs ─────────────────────────
       - name: Parse BEP and post results
         if: always()
@@ -367,6 +476,26 @@ jobs:
             const cachedActions = process.env.BAZEL_CACHED_ACTIONS || '0';
             const testCount = process.env.BAZEL_TEST_COUNT || '0';
             const affected = '${{ steps.affected.outputs.description || 'all targets' }}';
+            const hasGraph = '${{ steps.depgraph.outputs.has_graph }}' === 'true';
+            const rdepCount = '${{ steps.depgraph.outputs.rdep_count }}' || '0';
+            const changedPkgs = '${{ steps.depgraph.outputs.changed_pkgs }}' || '';
+
+            // Read Mermaid graph if available
+            let mermaidSection = '';
+            if (hasGraph) {
+              try {
+                const fs = require('fs');
+                const mermaid = fs.readFileSync('/tmp/dep-graph.mermaid', 'utf8');
+                mermaidSection = [
+                  '\n### 🔍 Blast Radius\n',
+                  `Changed: \`${changedPkgs.trim()}\` · **${rdepCount} targets affected**\n`,
+                  '> 🔴 Changed packages · 🟡 Affected dependents\n',
+                  '```mermaid',
+                  mermaid,
+                  '```',
+                ].join('\n');
+              } catch {}
+            }
 
             let slowSection = '';
             try {
@@ -413,6 +542,7 @@ jobs:
               `| ❌ Failed | ${failed} |`,
               `| ⚠️ Flaky | ${flaky} |`,
               `| Cache hit rate | ${cacheRate}% (${cachedActions}/${totalActions} actions) |`,
+              mermaidSection,
               slowSection,
               flakySection,
               '\n---',

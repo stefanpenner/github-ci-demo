@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Defines the dependency cascade graph between repos. When a dep is bumped in this repo, downstream repos listed here will receive a cascade dispatch.",
+  "cascades": {
+    "rules_go": {
+      "description": "Go rules — affects all Go targets",
+      "group_with": ["gazelle"],
+      "downstream": []
+    },
+    "gazelle": {
+      "description": "BUILD file generator for Go",
+      "group_with": ["rules_go"],
+      "downstream": []
+    }
+  },
+  "upstream": {
+    "description": "Repos that publish modules this repo consumes. Used by dep-cascade to know when to accept incoming cascade events.",
+    "modules": {}
+  }
+}

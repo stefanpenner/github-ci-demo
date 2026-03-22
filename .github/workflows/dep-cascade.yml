@@ -1,0 +1,471 @@
+# Coordinated multi-repo dependency cascade for Bazel modules.
+#
+# The problem: When module A publishes v2.0, module B (which depends on A)
+# needs to bump, rebuild, publish, and then module C (which depends on B)
+# needs the same. This is a cascade.
+#
+# This workflow:
+#   1. Receives a cascade event (repository_dispatch or workflow_dispatch)
+#   2. Updates MODULE.bazel with the new dep version
+#   3. Runs bazel mod tidy + build + test
+#   4. Creates/updates a PR with a live cascade status diagram
+#   5. Posts a Check Run showing the full cascade chain
+#   6. On merge: dispatches the next leg of the cascade to downstream repos
+#
+# The cascade is tracked by a cascade_id (e.g., "acme-libs-2.0-1711100000")
+# which ties all PRs across repos together.
+
+name: Dep Cascade
+
+on:
+  # Triggered by upstream repo or dep-doctor
+  repository_dispatch:
+    types: [dep-cascade]
+    # payload: {
+    #   cascade_id: "rules_go-0.51.0-1711100000",
+    #   dep_name: "rules_go",
+    #   dep_version: "0.51.0",
+    #   chain: [
+    #     { repo: "acme/libs", status: "merged", version: "1.1.0" },
+    #     { repo: "acme/api",  status: "pending", version: null }
+    #   ],
+    #   downstream: [
+    #     { repo: "acme/web", dep_name: "acme_api" }
+    #   ]
+    # }
+
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      cascade_id:
+        description: 'Cascade group ID'
+        required: true
+        type: string
+      dep_name:
+        description: 'Dependency to bump in MODULE.bazel'
+        required: true
+        type: string
+      dep_version:
+        description: 'New version'
+        required: true
+        type: string
+      chain_json:
+        description: 'JSON array of cascade chain state'
+        required: false
+        type: string
+        default: '[]'
+      downstream_json:
+        description: 'JSON array of downstream repos to cascade to'
+        required: false
+        type: string
+        default: '[]'
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+  issues: write
+
+jobs:
+  cascade:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazel-disk
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', '.bazelversion') }}
+          restore-keys: bazel-${{ runner.os }}-
+
+      # ── Resolve inputs ────────────────────────────────────
+      - name: Resolve cascade parameters
+        id: params
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Merge dispatch and repository_dispatch inputs
+            const payload = context.payload.client_payload || {};
+            const cascadeId = '${{ inputs.cascade_id }}' || payload.cascade_id || `manual-${Date.now()}`;
+            const depName = '${{ inputs.dep_name }}' || payload.dep_name || '';
+            const depVersion = '${{ inputs.dep_version }}' || payload.dep_version || '';
+            const chain = JSON.parse('${{ inputs.chain_json }}' || 'null') || payload.chain || [];
+            const downstream = JSON.parse('${{ inputs.downstream_json }}' || 'null') || payload.downstream || [];
+
+            if (!depName || !depVersion) {
+              core.setFailed('dep_name and dep_version are required');
+              return;
+            }
+
+            core.setOutput('cascade_id', cascadeId);
+            core.setOutput('dep_name', depName);
+            core.setOutput('dep_version', depVersion);
+            core.setOutput('chain', JSON.stringify(chain));
+            core.setOutput('downstream', JSON.stringify(downstream));
+
+            core.info(`Cascade ${cascadeId}: bumping ${depName} to ${depVersion}`);
+            core.info(`Chain: ${JSON.stringify(chain)}`);
+            core.info(`Downstream: ${JSON.stringify(downstream)}`);
+
+      # ── Check if PR already exists ────────────────────────
+      - name: Check for existing PR
+        id: existing
+        run: |
+          BRANCH="cascade/${{ steps.params.outputs.cascade_id }}"
+          EXISTING=$(gh pr list --head "$BRANCH" --json number,url -q '.[0]' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            PR_NUM=$(echo "$EXISTING" | jq -r '.number')
+            echo "::notice::PR #$PR_NUM already exists for cascade"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Update MODULE.bazel ───────────────────────────────
+      - name: Apply dependency bump
+        id: bump
+        run: |
+          DEP="${{ steps.params.outputs.dep_name }}"
+          NEW="${{ steps.params.outputs.dep_version }}"
+          CASCADE="${{ steps.params.outputs.cascade_id }}"
+          BRANCH="cascade/${CASCADE}"
+
+          # Create or checkout branch
+          if git show-ref --verify "refs/heads/$BRANCH" 2>/dev/null; then
+            git checkout "$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+          # Find current version
+          OLD=$(grep "bazel_dep.*name *= *\"${DEP}\"" MODULE.bazel | grep -oP 'version *= *"\K[^"]+')
+          if [ -z "$OLD" ]; then
+            echo "::error::Dependency ${DEP} not found in MODULE.bazel"
+            exit 1
+          fi
+
+          echo "old_version=$OLD" >> "$GITHUB_OUTPUT"
+
+          # Update
+          sed -i "s|bazel_dep(name = \"${DEP}\", version = \"${OLD}\")|bazel_dep(name = \"${DEP}\", version = \"${NEW}\")|" MODULE.bazel
+
+          echo "::group::Updated MODULE.bazel"
+          cat MODULE.bazel
+          echo "::endgroup::"
+
+          # Try bazel mod tidy
+          echo "::group::bazel mod tidy"
+          bazel mod tidy 2>&1 || echo "::warning::bazel mod tidy had issues"
+          echo "::endgroup::"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # ── Build & test affected targets ─────────────────────
+      - name: Build & test
+        id: test
+        run: |
+          DEP="${{ steps.params.outputs.dep_name }}"
+
+          echo "::group::Finding affected targets"
+          AFFECTED=$(bazel query "rdeps(//..., @${DEP}//...)" --output label 2>/dev/null || echo "//...")
+          echo "Affected: $AFFECTED"
+          echo "::endgroup::"
+
+          echo "::group::bazel test"
+          bazel test --config=ci $AFFECTED 2>&1 | tee /tmp/cascade-test.log
+          EXIT=${PIPESTATUS[0]}
+          echo "::endgroup::"
+
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          echo "passed=$([ $EXIT -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # ── Commit + create/update PR ─────────────────────────
+      - name: Commit and push
+        id: commit
+        run: |
+          git config user.name "dep-cascade[bot]"
+          git config user.email "dep-cascade[bot]@users.noreply.github.com"
+
+          git add MODULE.bazel MODULE.bazel.lock 2>/dev/null || git add MODULE.bazel
+
+          if git diff --cached --quiet; then
+            echo "::notice::No changes to commit"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DEP="${{ steps.params.outputs.dep_name }}"
+          NEW="${{ steps.params.outputs.dep_version }}"
+          CASCADE="${{ steps.params.outputs.cascade_id }}"
+
+          git commit -m "deps(cascade): bump ${DEP} → ${NEW}
+
+          Cascade: ${CASCADE}
+          Automated by dep-cascade workflow"
+
+          git push -u origin "${{ steps.bump.outputs.branch }}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ── Build cascade status diagram ──────────────────────
+      - name: Create/update PR with cascade status
+        if: steps.commit.outputs.changed == 'true' || steps.existing.outputs.exists == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+
+            const cascadeId = '${{ steps.params.outputs.cascade_id }}';
+            const depName = '${{ steps.params.outputs.dep_name }}';
+            const depVersion = '${{ steps.params.outputs.dep_version }}';
+            const oldVersion = '${{ steps.bump.outputs.old_version }}';
+            const chain = JSON.parse('${{ steps.params.outputs.chain }}');
+            const downstream = JSON.parse('${{ steps.params.outputs.downstream }}');
+            const testPassed = '${{ steps.test.outputs.passed }}' === 'true';
+            const branch = '${{ steps.bump.outputs.branch }}';
+            const existingPR = '${{ steps.existing.outputs.pr_number }}';
+
+            // Add this repo to the chain
+            const thisRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const thisEntry = {
+              repo: thisRepo,
+              status: testPassed ? 'ready' : 'failing',
+              dep: depName,
+              from: oldVersion,
+              to: depVersion,
+            };
+
+            const fullChain = [...chain, thisEntry];
+
+            // Build Mermaid cascade diagram
+            const statusIcon = (s) => {
+              switch(s) {
+                case 'merged': return '✅';
+                case 'ready': return '🟢';
+                case 'failing': return '🔴';
+                case 'pending': return '⏳';
+                default: return '❓';
+              }
+            };
+
+            const statusColor = (s) => {
+              switch(s) {
+                case 'merged': return 'fill:#40c057,color:#fff,stroke:#2b8a3e';
+                case 'ready': return 'fill:#82c91e,color:#333,stroke:#5c940d';
+                case 'failing': return 'fill:#ff6b6b,color:#fff,stroke:#c92a2a';
+                case 'pending': return 'fill:#868e96,color:#fff,stroke:#495057';
+                default: return 'fill:#e9ecef,color:#333';
+              }
+            };
+
+            let mermaid = 'graph LR';
+
+            // Add chain nodes
+            for (let i = 0; i < fullChain.length; i++) {
+              const c = fullChain[i];
+              const node = `repo${i}`;
+              const label = `${statusIcon(c.status)} ${c.repo.split('/')[1]}`;
+              mermaid += `\n    ${node}["${label}"]`;
+              if (i > 0) {
+                mermaid += `\n    repo${i-1} --> ${node}`;
+              }
+            }
+
+            // Add downstream (pending) nodes
+            for (let i = 0; i < downstream.length; i++) {
+              const d = downstream[i];
+              const node = `down${i}`;
+              const label = `⏳ ${d.repo.split('/')[1]}`;
+              mermaid += `\n    ${node}["${label}"]`;
+              mermaid += `\n    repo${fullChain.length - 1} --> ${node}`;
+            }
+
+            // Style nodes
+            for (let i = 0; i < fullChain.length; i++) {
+              mermaid += `\n    style repo${i} ${statusColor(fullChain[i].status)}`;
+            }
+            for (let i = 0; i < downstream.length; i++) {
+              mermaid += `\n    style down${i} ${statusColor('pending')}`;
+            }
+
+            // Build chain status table
+            const chainTable = fullChain.map(c =>
+              `| ${statusIcon(c.status)} | \`${c.repo}\` | ${c.dep} ${c.from} → ${c.to} | **${c.status}** |`
+            ).join('\n');
+
+            const downstreamTable = downstream.length > 0
+              ? '\n\n### Waiting\n\n| | Repo | Dep |\n|--|------|-----|\n' +
+                downstream.map(d => `| ⏳ | \`${d.repo}\` | ${d.dep_name} |`).join('\n')
+              : '';
+
+            const body = [
+              `## 🔗 Dependency Cascade: \`${cascadeId}\`\n`,
+              `Bumping \`${depName}\` from \`${oldVersion}\` to \`${depVersion}\`\n`,
+              '### Cascade Status\n',
+              '```mermaid',
+              mermaid,
+              '```\n',
+              '| | Repo | Change | Status |',
+              '|--|------|--------|--------|',
+              chainTable,
+              downstreamTable,
+              '',
+              '### How this works\n',
+              '1. Each repo in the cascade bumps its dependency and runs CI',
+              '2. When a PR is merged, the cascade automatically continues to the next repo',
+              '3. Downstream repos wait until all upstream deps are merged',
+              '',
+              testPassed
+                ? '> ✅ CI passed — this PR is ready to merge. Merging will trigger the next leg of the cascade.'
+                : '> 🔴 CI failed — fix the failures before merging. The cascade is paused.',
+              '',
+              `<!-- dep-cascade:${cascadeId} -->`,
+            ].join('\n');
+
+            // Create or update PR
+            let prNumber;
+            if (existingPR) {
+              prNumber = parseInt(existingPR);
+              await github.rest.pulls.update({
+                ...context.repo,
+                pull_number: prNumber,
+                body,
+              });
+              core.info(`Updated PR #${prNumber}`);
+            } else {
+              const { data: pr } = await github.rest.pulls.create({
+                ...context.repo,
+                title: `deps(cascade): bump ${depName} → ${depVersion}`,
+                head: branch,
+                base: 'main',
+                body,
+              });
+              prNumber = pr.number;
+              core.info(`Created PR #${prNumber}: ${pr.html_url}`);
+            }
+
+            // Add labels
+            try {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: prNumber,
+                labels: ['dependencies', `cascade:${cascadeId}`],
+              });
+            } catch {}
+
+            // Post Check Run with cascade state
+            const sha = '${{ steps.commit.outputs.sha }}' || execSync('git rev-parse HEAD').toString().trim();
+            await github.rest.checks.create({
+              ...context.repo,
+              name: `Cascade: ${cascadeId}`,
+              head_sha: sha,
+              status: 'completed',
+              conclusion: testPassed ? 'success' : 'failure',
+              output: {
+                title: testPassed
+                  ? `🟢 Ready to merge (${fullChain.filter(c => c.status === 'merged').length}/${fullChain.length + downstream.length} complete)`
+                  : `🔴 CI failing — cascade paused`,
+                summary: [
+                  `## Cascade: \`${cascadeId}\`\n`,
+                  '| | Repo | Change | Status |',
+                  '|--|------|--------|--------|',
+                  chainTable,
+                  downstreamTable,
+                ].join('\n'),
+              },
+              actions: [
+                { label: 'Re-run', description: 'Re-run this cascade leg', identifier: 'cascade_rerun' },
+              ],
+            });
+
+            // Export for the dispatch step
+            core.exportVariable('CASCADE_PR_NUMBER', prNumber);
+            core.exportVariable('CASCADE_TEST_PASSED', testPassed);
+            core.exportVariable('FULL_CHAIN', JSON.stringify(fullChain));
+
+  # ── Dispatch downstream on merge ──────────────────────────
+  # This runs when a cascade PR is merged, triggering the next leg.
+  dispatch-downstream:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if this is a cascade PR
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const match = body.match(/<!-- dep-cascade:(.+?) -->/);
+            if (!match) {
+              core.info('Not a cascade PR');
+              core.setOutput('is_cascade', 'false');
+              return;
+            }
+
+            core.setOutput('is_cascade', 'true');
+            core.setOutput('cascade_id', match[1]);
+
+            // Parse the cascade info from labels
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const cascadeLabel = labels.find(l => l.startsWith('cascade:'));
+            core.info(`Cascade PR merged: ${match[1]}`);
+
+      - name: Dispatch to downstream repos
+        if: steps.check.outputs.is_cascade == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cascadeId = '${{ steps.check.outputs.cascade_id }}';
+
+            // In production, you'd store the downstream list in the PR body
+            // or in a config file. For this demo, we parse it from the PR body.
+            const body = context.payload.pull_request.body || '';
+
+            // Extract downstream repos from the Waiting section
+            const waitingMatch = body.match(/### Waiting\n\n\|.*\n\|.*\n([\s\S]*?)(?:\n\n|$)/);
+            if (!waitingMatch) {
+              core.info('No downstream repos to cascade to');
+              return;
+            }
+
+            const lines = waitingMatch[1].split('\n').filter(l => l.includes('|'));
+            for (const line of lines) {
+              const repoMatch = line.match(/`([^`]+\/[^`]+)`/);
+              const depMatch = line.match(/\| ([^\|]+) \|$/);
+              if (!repoMatch) continue;
+
+              const [owner, repo] = repoMatch[1].split('/');
+              const depName = depMatch ? depMatch[1].trim() : '';
+
+              core.info(`Dispatching cascade to ${owner}/${repo}`);
+
+              try {
+                await github.rest.repos.createDispatchEvent({
+                  owner, repo,
+                  event_type: 'dep-cascade',
+                  client_payload: {
+                    cascade_id: cascadeId,
+                    dep_name: depName,
+                    dep_version: 'latest', // downstream resolves this
+                    chain: JSON.parse(process.env.FULL_CHAIN || '[]'),
+                    downstream: [], // next leg figures out its own downstream
+                  },
+                });
+                core.info(`Dispatched to ${owner}/${repo}`);
+              } catch (e) {
+                core.warning(`Failed to dispatch to ${owner}/${repo}: ${e.message}`);
+              }
+            }

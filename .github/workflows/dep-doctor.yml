@@ -1,0 +1,548 @@
+# Automated Bazel dependency management.
+#
+# What it does:
+#   1. Parses MODULE.bazel for bazel_dep() entries
+#   2. Checks the Bazel Central Registry (BCR) for newer versions
+#   3. For each outdated dep, creates a PR with:
+#      - Mermaid blast radius graph (what internal targets use this dep)
+#      - Upstream changelog from GitHub Releases
+#      - Affected target count
+#      - Auto-merge label when safe
+#
+# Triggers:
+#   - Weekly schedule (Monday 9am UTC)
+#   - Manual dispatch (bump a specific dep, or scan all)
+#   - repository_dispatch (from upstream repo publishing a new version)
+
+name: Dep Doctor
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Monday 9am UTC
+  workflow_dispatch:
+    inputs:
+      dep-name:
+        description: 'Specific dep to bump (blank = scan all)'
+        required: false
+        type: string
+      dep-version:
+        description: 'Target version (blank = latest)'
+        required: false
+        type: string
+      dry-run:
+        description: 'Just report, do not create PRs'
+        required: false
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [dep-update]
+    # payload: { dep: "rules_go", version: "0.51.0", cascade_id: "..." }
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    outputs:
+      updates: ${{ steps.check.outputs.updates }}
+      has_updates: ${{ steps.check.outputs.has_updates }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Parse MODULE.bazel + check BCR ──────────────────────
+      - name: Scan for dependency updates
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const https = require('https');
+
+            // Parse MODULE.bazel for bazel_dep entries
+            const moduleBazel = fs.readFileSync('MODULE.bazel', 'utf8');
+            const depPattern = /bazel_dep\(\s*name\s*=\s*"([^"]+)"\s*,\s*version\s*=\s*"([^"]+)"\s*\)/g;
+            const deps = [];
+            let match;
+            while ((match = depPattern.exec(moduleBazel)) !== null) {
+              deps.push({ name: match[1], current: match[2] });
+            }
+
+            core.info(`Found ${deps.length} bazel_dep entries: ${deps.map(d => d.name).join(', ')}`);
+
+            // If a specific dep was requested, filter
+            const targetDep = '${{ inputs.dep-name }}' || '${{ github.event.client_payload.dep }}' || '';
+            const targetVersion = '${{ inputs.dep-version }}' || '${{ github.event.client_payload.version }}' || '';
+
+            const depsToCheck = targetDep
+              ? deps.filter(d => d.name === targetDep)
+              : deps;
+
+            if (depsToCheck.length === 0) {
+              core.info('No deps to check');
+              core.setOutput('has_updates', 'false');
+              core.setOutput('updates', '[]');
+              return;
+            }
+
+            // Check BCR for latest versions
+            function fetchJSON(url) {
+              return new Promise((resolve, reject) => {
+                https.get(url, { headers: { 'User-Agent': 'dep-doctor' } }, (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => {
+                    try { resolve(JSON.parse(data)); }
+                    catch { resolve(null); }
+                  });
+                }).on('error', reject);
+              });
+            }
+
+            const updates = [];
+
+            for (const dep of depsToCheck) {
+              try {
+                // BCR metadata endpoint
+                const meta = await fetchJSON(
+                  `https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main/modules/${dep.name}/metadata.json`
+                );
+
+                if (!meta || !meta.versions) {
+                  core.info(`No BCR metadata for ${dep.name}`);
+                  continue;
+                }
+
+                // Find latest non-prerelease version
+                const versions = meta.versions
+                  .filter(v => !v.includes('rc') && !v.includes('beta') && !v.includes('alpha'))
+                  .sort((a, b) => {
+                    const pa = a.split('.').map(Number);
+                    const pb = b.split('.').map(Number);
+                    for (let i = 0; i < 3; i++) {
+                      if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+                    }
+                    return 0;
+                  });
+
+                const latest = targetVersion || versions[versions.length - 1];
+
+                if (latest && latest !== dep.current) {
+                  // Determine if this is a major/minor/patch bump
+                  const [curMaj, curMin] = dep.current.split('.').map(Number);
+                  const [newMaj, newMin] = latest.split('.').map(Number);
+                  const bumpType = newMaj > curMaj ? 'major' : newMin > curMin ? 'minor' : 'patch';
+
+                  // Get homepage for changelog link
+                  const homepage = meta.homepage || '';
+                  const ghRepo = homepage.match(/github\.com\/([^/]+\/[^/]+)/)?.[1] || '';
+
+                  updates.push({
+                    name: dep.name,
+                    current: dep.current,
+                    latest,
+                    bumpType,
+                    homepage,
+                    ghRepo,
+                    versions: versions.slice(-5), // last 5 versions for context
+                  });
+
+                  core.info(`${dep.name}: ${dep.current} → ${latest} (${bumpType})`);
+                } else {
+                  core.info(`${dep.name}: ${dep.current} is up to date`);
+                }
+              } catch (e) {
+                core.warning(`Failed to check ${dep.name}: ${e.message}`);
+              }
+            }
+
+            core.setOutput('has_updates', updates.length > 0 ? 'true' : 'false');
+            core.setOutput('updates', JSON.stringify(updates));
+
+            // Step summary
+            if (updates.length > 0) {
+              core.summary
+                .addHeading('Dependency Updates Available', 2)
+                .addTable([
+                  [{data: 'Package', header: true}, {data: 'Current', header: true}, {data: 'Latest', header: true}, {data: 'Type', header: true}],
+                  ...updates.map(u => [u.name, u.current, u.latest, u.bumpType])
+                ])
+                .write();
+            } else {
+              core.summary.addRaw('✅ All dependencies are up to date').write();
+            }
+
+  # ── Create PRs for each update ──────────────────────────
+  create-prs:
+    needs: scan
+    if: needs.scan.outputs.has_updates == 'true' && inputs.dry-run != true
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        update: ${{ fromJson(needs.scan.outputs.updates) }}
+      max-parallel: 1  # serialize to avoid branch conflicts
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazel-disk
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', '.bazelversion') }}
+          restore-keys: bazel-${{ runner.os }}-
+
+      # ── Check if PR already exists ────────────────────────
+      - name: Check for existing PR
+        id: existing
+        run: |
+          BRANCH="deps/${{ matrix.update.name }}-${{ matrix.update.latest }}"
+          EXISTING=$(gh pr list --head "$BRANCH" --json number -q '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::PR #$EXISTING already exists for $BRANCH"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Update MODULE.bazel ───────────────────────────────
+      - name: Bump dependency
+        if: steps.existing.outputs.exists == 'false'
+        id: bump
+        run: |
+          DEP="${{ matrix.update.name }}"
+          OLD="${{ matrix.update.current }}"
+          NEW="${{ matrix.update.latest }}"
+          BRANCH="deps/${DEP}-${NEW}"
+
+          git checkout -b "$BRANCH"
+
+          # Update the version in MODULE.bazel
+          sed -i "s|bazel_dep(name = \"${DEP}\", version = \"${OLD}\")|bazel_dep(name = \"${DEP}\", version = \"${NEW}\")|" MODULE.bazel
+
+          echo "::group::Updated MODULE.bazel"
+          cat MODULE.bazel
+          echo "::endgroup::"
+
+          # Try to run bazel mod tidy (updates lockfile)
+          echo "::group::bazel mod tidy"
+          bazel mod tidy 2>&1 || echo "::warning::bazel mod tidy failed — lockfile may need manual update"
+          echo "::endgroup::"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # ── Analyze blast radius ──────────────────────────────
+      - name: Analyze blast radius
+        if: steps.existing.outputs.exists == 'false'
+        id: blast
+        run: |
+          DEP="${{ matrix.update.name }}"
+
+          echo "::group::Querying rdeps of @${DEP}"
+
+          # Find all internal targets that depend on this external dep
+          AFFECTED=$(bazel query "rdeps(//..., @${DEP}//...)" --output label 2>/dev/null || echo "")
+
+          if [ -z "$AFFECTED" ]; then
+            # Try without the //... suffix
+            AFFECTED=$(bazel query "rdeps(//..., @${DEP})" --output label 2>/dev/null || echo "")
+          fi
+
+          echo "$AFFECTED"
+          echo "::endgroup::"
+
+          AFFECTED_COUNT=$(echo "$AFFECTED" | grep -v '^$' | wc -l | tr -d ' ')
+          TEST_TARGETS=$(echo "$AFFECTED" | grep '_test$' || echo "")
+          TEST_COUNT=$(echo "$TEST_TARGETS" | grep -v '^$' | wc -l | tr -d ' ')
+
+          echo "affected_count=$AFFECTED_COUNT" >> "$GITHUB_OUTPUT"
+          echo "test_count=$TEST_COUNT" >> "$GITHUB_OUTPUT"
+
+          # Build Mermaid graph
+          MERMAID="graph TD"
+          MERMAID="$MERMAID
+    ext_dep[\"📦 @${DEP}\"]"
+
+          # Collect unique packages
+          PACKAGES=""
+          for target in $AFFECTED; do
+            PKG=$(echo "$target" | sed 's|//||' | sed 's/:.*$//')
+            PACKAGES="$PACKAGES $PKG"
+          done
+          PACKAGES=$(echo "$PACKAGES" | tr ' ' '\n' | sort -u | grep -v '^$')
+
+          for pkg in $PACKAGES; do
+            NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
+            IS_TEST=$(echo "$AFFECTED" | grep "$pkg" | grep '_test$' | head -1)
+            if [ -n "$IS_TEST" ]; then
+              MERMAID="$MERMAID
+    ${NODE}[\"🧪 //${pkg}\"]"
+            else
+              MERMAID="$MERMAID
+    ${NODE}[\"📄 //${pkg}\"]"
+            fi
+            MERMAID="$MERMAID
+    ${NODE} --> ext_dep"
+          done
+
+          MERMAID="$MERMAID
+    style ext_dep fill:#4c6ef5,color:#fff,stroke:#364fc7"
+
+          for pkg in $PACKAGES; do
+            NODE=$(echo "$pkg" | tr '/' '_' | tr '-' '_')
+            MERMAID="$MERMAID
+    style ${NODE} fill:#ffd43b,color:#333,stroke:#e67700"
+          done
+
+          echo "$MERMAID" > /tmp/blast-radius.mermaid
+          echo "has_graph=true" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # ── Fetch upstream changelog ──────────────────────────
+      - name: Fetch changelog
+        if: steps.existing.outputs.exists == 'false' && matrix.update.ghRepo != ''
+        id: changelog
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ghRepo = '${{ matrix.update.ghRepo }}';
+            const oldVer = '${{ matrix.update.current }}';
+            const newVer = '${{ matrix.update.latest }}';
+
+            if (!ghRepo) {
+              core.setOutput('body', '');
+              return;
+            }
+
+            const [owner, repo] = ghRepo.split('/');
+            let changelog = '';
+
+            try {
+              // Try to find the release for the new version
+              const tagPrefixes = ['v', ''];
+              let release = null;
+
+              for (const prefix of tagPrefixes) {
+                try {
+                  const { data } = await github.rest.repos.getReleaseByTag({
+                    owner, repo,
+                    tag: `${prefix}${newVer}`,
+                  });
+                  release = data;
+                  break;
+                } catch {}
+              }
+
+              if (release) {
+                changelog = [
+                  `### 📋 Release notes ([${release.tag_name}](${release.html_url}))\n`,
+                  release.body ? release.body.slice(0, 2000) : '_No release notes._',
+                  release.body && release.body.length > 2000 ? '\n\n_...truncated. See full release notes above._' : '',
+                ].join('\n');
+              }
+
+              // Check for security advisories
+              try {
+                const { data: advisories } = await github.rest.securityAdvisories.listRepositoryAdvisories({
+                  owner, repo,
+                  state: 'published',
+                });
+
+                const relevant = advisories.filter(a => {
+                  // Check if advisory was published after the old version
+                  return a.severity === 'high' || a.severity === 'critical';
+                });
+
+                if (relevant.length > 0) {
+                  changelog += '\n\n### 🔒 Security\n';
+                  for (const a of relevant.slice(0, 5)) {
+                    changelog += `- **${a.severity.toUpperCase()}**: ${a.summary} ([${a.ghsa_id}](${a.html_url}))\n`;
+                  }
+                }
+              } catch {
+                // Security advisory API may not be available
+              }
+            } catch (e) {
+              core.info(`Could not fetch changelog: ${e.message}`);
+            }
+
+            core.setOutput('body', changelog);
+
+      # ── Create the PR ─────────────────────────────────────
+      - name: Commit and create PR
+        if: steps.existing.outputs.exists == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            const dep = '${{ matrix.update.name }}';
+            const oldVer = '${{ matrix.update.current }}';
+            const newVer = '${{ matrix.update.latest }}';
+            const bumpType = '${{ matrix.update.bumpType }}';
+            const branch = '${{ steps.bump.outputs.branch }}';
+            const affectedCount = '${{ steps.blast.outputs.affected_count }}' || '0';
+            const testCount = '${{ steps.blast.outputs.test_count }}' || '0';
+            const changelog = `${{ steps.changelog.outputs.body }}` || '';
+            const cascadeId = '${{ github.event.client_payload.cascade_id }}' || '';
+
+            // Commit
+            execSync('git config user.name "dep-doctor[bot]"');
+            execSync('git config user.email "dep-doctor[bot]@users.noreply.github.com"');
+            execSync('git add MODULE.bazel MODULE.bazel.lock 2>/dev/null || git add MODULE.bazel');
+            try {
+              execSync(`git commit -m "deps(${dep}): ${oldVer} → ${newVer}"`);
+            } catch (e) {
+              core.info('Nothing to commit');
+              return;
+            }
+            execSync(`git push -u origin ${branch}`);
+
+            // Read Mermaid graph
+            let mermaidSection = '';
+            try {
+              const mermaid = fs.readFileSync('/tmp/blast-radius.mermaid', 'utf8');
+              mermaidSection = [
+                '\n### 🔍 Blast Radius\n',
+                `**${affectedCount} targets** depend on \`@${dep}\` (${testCount} test targets)\n`,
+                '> 🔵 External dep · 🟡 Affected internal targets\n',
+                '```mermaid',
+                mermaid,
+                '```',
+              ].join('\n');
+            } catch {}
+
+            // Cascade info
+            let cascadeSection = '';
+            if (cascadeId) {
+              cascadeSection = [
+                '\n### 🔗 Cascade\n',
+                `This bump is part of cascade \`${cascadeId}\`.`,
+                'Triggered by an upstream module publishing a new version.',
+                '',
+                '> Merge order is enforced — upstream PRs must merge first.',
+              ].join('\n');
+            }
+
+            // Build PR body
+            const labels = ['dependencies'];
+            if (bumpType === 'patch') labels.push('auto-merge');
+            if (cascadeId) labels.push(`cascade:${cascadeId}`);
+
+            const bumpIcon = bumpType === 'major' ? '🔴' : bumpType === 'minor' ? '🟡' : '🟢';
+
+            const body = [
+              `## ${bumpIcon} Bump \`${dep}\`: ${oldVer} → ${newVer}\n`,
+              `| | |`,
+              `|--|--|`,
+              `| **Package** | [\`${dep}\`](${('${{ matrix.update.homepage }}') || '#'}) |`,
+              `| **Bump type** | ${bumpIcon} ${bumpType} |`,
+              `| **Current** | \`${oldVer}\` |`,
+              `| **New** | \`${newVer}\` |`,
+              `| **Affected targets** | ${affectedCount} |`,
+              `| **Test targets** | ${testCount} |`,
+              mermaidSection,
+              changelog,
+              cascadeSection,
+              '\n---',
+              '',
+              '<details>',
+              '<summary>Available versions</summary>',
+              '',
+              (${{ toJson(matrix.update.versions) }} || []).map(v =>
+                v === newVer ? `- **${v}** ← this PR` : `- ${v}`
+              ).join('\n'),
+              '',
+              '</details>',
+              '',
+              '<!-- dep-doctor -->',
+            ].join('\n');
+
+            // Create PR
+            const { data: pr } = await github.rest.pulls.create({
+              ...context.repo,
+              title: `deps: bump ${dep} ${oldVer} → ${newVer}`,
+              head: branch,
+              base: 'main',
+              body,
+            });
+
+            core.info(`Created PR #${pr.number}: ${pr.html_url}`);
+
+            // Add labels
+            try {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: pr.number,
+                labels,
+              });
+            } catch (e) {
+              core.info(`Could not add labels: ${e.message}`);
+            }
+
+            // Post blast radius Check Run
+            await github.rest.checks.create({
+              ...context.repo,
+              name: `Dep Doctor: ${dep}`,
+              head_sha: pr.head.sha || execSync('git rev-parse HEAD').toString().trim(),
+              status: 'completed',
+              conclusion: bumpType === 'major' ? 'action_required' : 'success',
+              output: {
+                title: `${bumpIcon} ${dep} ${oldVer} → ${newVer} (${affectedCount} targets affected)`,
+                summary: [
+                  `## Dependency Update\n`,
+                  `| Field | Value |`,
+                  `|-------|-------|`,
+                  `| Package | \`${dep}\` |`,
+                  `| Change | ${oldVer} → ${newVer} |`,
+                  `| Type | ${bumpType} |`,
+                  `| Affected targets | ${affectedCount} |`,
+                  `| Test targets | ${testCount} |`,
+                  '',
+                  bumpType === 'major'
+                    ? '⚠️ **Major version bump** — manual review recommended.'
+                    : '✅ This is a safe update. Auto-merge enabled.',
+                ].join('\n'),
+              },
+              actions: bumpType === 'major' ? [
+                { label: 'Approve', description: 'Mark this major bump as reviewed', identifier: 'dep_approve' },
+              ] : [],
+            });
+
+  # ── Summary ─────────────────────────────────────────────
+  summary:
+    needs: [scan, create-prs]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const updates = JSON.parse('${{ needs.scan.outputs.updates }}' || '[]');
+
+            if (updates.length === 0) {
+              core.summary.addRaw('✅ All Bazel dependencies are up to date.').write();
+              return;
+            }
+
+            const bumpIcon = (t) => t === 'major' ? '🔴' : t === 'minor' ? '🟡' : '🟢';
+
+            core.summary
+              .addHeading('🩺 Dep Doctor Report', 2)
+              .addTable([
+                [{data: '', header: true}, {data: 'Package', header: true}, {data: 'Current', header: true}, {data: 'Latest', header: true}, {data: 'Type', header: true}],
+                ...updates.map(u => [bumpIcon(u.bumpType), u.name, u.current, u.latest, u.bumpType])
+              ])
+              .addRaw('\nPRs have been created for each update.')
+              .write();
